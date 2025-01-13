@@ -25,7 +25,7 @@
 static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 
 /* STEP 8.1 - Define the transmission buffer, which is a buffer to hold the data to be sent over UART */
-static uint8_t tx_buf[] = "Async UART Demo: enter 1 to toggle LED.\n\r";
+static uint8_t tx_buf[] = "Hello, World!\n\r";
 
 /* STEP 9.1.2 - Define the receive buffer */
 static uint8_t rx_buf[RECEIVE_BUFF_SIZE] = { 0 };
@@ -80,19 +80,11 @@ int main(void)
         return 1;
     }
 
-    /* STEP 8.2 - Send the data over UART by calling uart_tx() */
-    ret = uart_tx(uart, tx_buf, sizeof(tx_buf), SYS_FOREVER_US);
-    if (ret) {
-        return 1;
-    }
-
-    /* STEP 9.3  - Start receiving by calling uart_rx_enable() and pass it the address of the receive  buffer */
-    ret = uart_rx_enable(uart, rx_buf, sizeof(rx_buf), RECEIVE_TIMEOUT);
-    if (ret) {
-        return 1;
-    }
-
 	while (1) {
+        ret = uart_tx(uart, tx_buf, sizeof(tx_buf), SYS_FOREVER_US);
+        if (ret) {
+            return 1;
+        }
 		k_msleep(SLEEP_TIME_MS);
-	}
+    }
 }
