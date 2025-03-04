@@ -1,54 +1,134 @@
 /*
- * Copyright (c) 2016 Intel Corporation
- *
- * SPDX-License-Identifier: Apache-2.0
- */
+    What happens when a pre-emptive thread (B) tries to use the
+    uart_tx function to start a transfer when another thread (A)
+    has already started a transfer that is still ongoing?
 
-#include <zephyr.h>
-#include <device.h>
-#include <devicetree.h>
-#include <drivers/gpio.h>
-#include <sys/printk.h>
-/* STEP 3 - Include the header file of the UART driver in main.c */
+    Answer: uart_tx returns -EBUSY if a transfer is already ongoing
+    which may be used to hold off the second thread until the first
+    is complete.
+*/
 
-/* 1000 msec = 1 sec */
-#define SLEEP_TIME_MS   1000
+#include <stdio.h>
+#include <inttypes.h>
 
-/* STEP 9.1.1 - Define the size of the receive buffer */
+#include <zephyr/kernel.h>
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/drivers/uart.h>
 
-/* STEP 9.2 - Define the receiving timeout period */
+#include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(async_uart, LOG_LEVEL_INF);
 
-/* STEP 5.1 - Get C identifiers for the DeviceTree labels and properties' values related to LEDs */
+/* Handle for UART peripheral obtained from devicetree. */
+static const struct device *uart = DEVICE_DT_GET(DT_NODELABEL(uart0));
 
-static const struct device *leds;
+/* UART configuration: 8N1, 115200 bps, no flow control (hardware or software). */
+static const struct uart_config uart_cfg = {
+    .baudrate   = 115200,
+    .parity     = UART_CFG_PARITY_NONE,
+    .stop_bits  = UART_CFG_STOP_BITS_1,
+    .data_bits  = UART_CFG_DATA_BITS_8,
+    .flow_ctrl  = UART_CFG_FLOW_CTRL_NONE
+};
 
-/* STEP 8.1 - Define the transmission buffer, which is a buffer to hold the data to be sent over UART */
+/* Buffers to be used by the UART. */
+static char uart_tx_buff[128] = { 0 };
 
+static K_SEM_DEFINE(uart_tx_sem, 0, 1);
 
-/* STEP 9.1.2 - Define the receive buffer */
-
-
-/* STEP 6 - Define the callback function for UART */
-
-int main(void)
+/* Application callback function for UART asynchronous events. */
+static void uart_cb(const struct device *dev, struct uart_event *evt, void *user_data)
 {
-	int ret;
-	leds = device_get_binding(LED0);
-	if (leds == NULL) {
-		return 1 ;
-	}
+    (void)user_data;
 
-/* STEP 4 - Get the device struct of the UART hardware */
+    switch (evt->type)
+    {
+        case UART_TX_DONE:
+            LOG_HEXDUMP_INF(evt->data.tx.buf, evt->data.tx.len, "Last sent:");
+            /* Release the binary semaphore to whichever thread is ready to take it.
+               Note: giving a sempahore is a non-blocking operation so should be
+               safe to call from a callback/isr context. */
+            k_sem_give(&uart_tx_sem);
+            break;
 
-/* STEP 5.2 - Configure the LEDs */
-
-/* STEP 7 - Register the UART callback function */
-
-/* STEP 8.2 - Send the data over UART by calling uart_tx() */
-
-/* STEP 9.3  - Start receiving by calling uart_rx_enable() and pass it the address of the receive  buffer */
-
-	while (1) {
-		k_msleep(SLEEP_TIME_MS);
-	}
+        default:
+            break;
+    }
 }
+
+static int my_uart_init(void)
+{
+    int err = 0;
+    if (!device_is_ready(uart)) {
+        LOG_ERR("UART device %s not ready.", uart->name);
+        return -ENODEV;
+    }
+
+    err = uart_configure(uart, &uart_cfg);
+    if (err == -ENOSYS) {
+        LOG_ERR("UART port %s config failed.", uart->name);
+        return -ENOSYS;
+    }
+
+    err = uart_callback_set(uart, uart_cb, NULL);
+    if (err) {
+        LOG_ERR("UART port %s cb reg failed (err %d).", uart->name, err);
+    }
+    return err;
+}
+
+int main(void) /* Main thread = thread A. */
+{
+    int err = 0;
+
+    /* Prepare UART for operation. */
+    err = my_uart_init();
+    if (err) {
+        LOG_ERR("UART init failed (err %d).", err);
+        return err;
+    }
+    LOG_INF("UART init success.");
+
+    uint32_t counter = 0;
+
+    for (;;) {
+        snprintf(uart_tx_buff, sizeof(uart_tx_buff), "[Thread A] Hello World %d", ++counter);
+        err = uart_tx(uart, uart_tx_buff, strlen(uart_tx_buff), 0);
+        if (err == -EBUSY) {
+            LOG_WRN("[Thread A] Thread B's transfer is still ongoing...");
+            k_sem_take(&uart_tx_sem, K_FOREVER);
+        }
+        /* Note: no blocking call like a sleep in this while forever loop!
+           This is because we are relying instead on the above
+           semaphore-take operation (which is forever blocking) to avoid
+           busywaiting in thread or starving other threads. */
+    }
+
+	return 0;
+}
+
+int threadB_target_fn(void*, void*, void*)
+{
+    int err = 0;
+    uint32_t counter = 0;
+    for (;;) {
+        snprintf(uart_tx_buff, sizeof(uart_tx_buff), "[Thread B] Hello World %d", ++counter);
+        err = uart_tx(uart, uart_tx_buff, strlen(uart_tx_buff), 0);
+        if (err == -EBUSY) {
+            LOG_WRN("[Thread B] UART-TX busy, wait...");
+            k_sem_take(&uart_tx_sem, K_FOREVER);
+        }
+    }
+
+    return 0;
+}
+
+/*
+    TODO:
+    1. Start these two threads.
+    2. Figure out a UART-TX access policy with regards to 2 operations:
+        + Checking if return value of uart_tx is -EBUSY
+        + Waiting on a semaphore is busy. 
+    3. Add possible more threads to test out the policy and figure out 
+       which one works best for which siutation.
+*/
